@@ -1358,7 +1358,7 @@ def _src_duckduckgo(query):
 
 
 # ── Source 4: Pollinations AI ─────────────────────────────────────────────────
-POLLINATIONS_API_KEY = "sk_HdL3sNJTH5Ur8KeyKkg91aaz2bZs66t3"
+POLLINATIONS_API_KEY = st.secrets.get("POLLINATIONS_API_KEY") or os.environ.get("POLLINATIONS_API_KEY", "")
 _POLL_HEADERS = {
     **_HEADERS,
     "Referer": "https://pollinations.ai/",
