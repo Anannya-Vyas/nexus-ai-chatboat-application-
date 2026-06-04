@@ -1,0 +1,8 @@
+streamlit
+groq
+requests
+pillow
+PyMuPDF
+python-docx
+duckduckgo-search
+numpy
