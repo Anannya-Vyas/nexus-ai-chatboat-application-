@@ -2605,29 +2605,47 @@ def process_input(user_text):
                 break
         return "image_gen", prompt or user_text
 
-    # File analysis — MUST come before vision check so PDF/DOCX always wins over camera
-    if st.session_state.file_content:
-        file_words = ["pdf", "document", "docx", "csv", "file", "attached", "attachment", "uploaded", "doc", "text", "json"]
-        referential = ["summarize", "explain this", "what is this", "what's this", "what does this",
-                       "analyze", "analyse", "tell me about", "from this", "in this", "key points",
-                       "main points", "main idea", "based on", "according to", "this text", "this pdf",
-                       "this file", "this document", "about this", "talking about"]
-        # If a file is loaded, route to file analysis unless user is clearly asking about the camera
-        camera_override_kw = ["photo", "camera", "picture i took", "snapshot", "webcam"]
-        if not any(k in lower for k in camera_override_kw):
-            # Route to file if user mentions file keywords, referential phrases, OR just asks a general question
-            if any(w in lower for w in file_words) or any(p in lower for p in referential):
-                return "file", user_text
-            # Also auto-route short queries to file when file is loaded (user is likely asking about it)
-            if len(user_text.split()) <= 20:
-                return "file", user_text
+    # ── Intent-driven routing: camera vs file — user's words decide, not load order ──
 
-    # Vision — camera image attached
-    vis_kw = ["what do you see", "what is this", "describe this", "analyze this", "explain this",
-              "describe the", "identify", "recognize", "read this", "what's in", "solve this",
-              "transcribe", "what does this show", "tell me about"]
-    if st.session_state.camera_image_b64:
-        if any(k in lower for k in vis_kw) or "?" in user_text or len(user_text.split()) <= 15:
+    # Keywords that clearly mean the user is asking about the camera/photo
+    camera_intent_kw = [
+        "photo", "camera", "image", "picture", "snapshot", "webcam",
+        "attached image", "this image", "the image", "what do you see",
+        "what is this", "describe this", "analyze this", "explain this",
+        "describe the", "identify", "recognize", "read this", "what's in",
+        "solve this", "transcribe", "what does this show", "tell me about this image",
+        "look at this", "see this"
+    ]
+
+    # Keywords that clearly mean the user is asking about the file/PDF/doc
+    file_intent_kw = [
+        "pdf", "document", "docx", "csv", "file", "attached file", "uploaded",
+        "attachment", "doc", "json", "this file", "the file", "this pdf", "the pdf",
+        "this document", "the document", "summarize", "key points", "main points",
+        "main idea", "based on", "according to", "this text", "talking about",
+        "from this", "in this", "what does this say", "what is in", "contents of",
+        "analyze the", "analyse the", "explain the", "extract"
+    ]
+
+    user_wants_camera = any(k in lower for k in camera_intent_kw)
+    user_wants_file   = any(k in lower for k in file_intent_kw)
+
+    # If user explicitly mentions camera/image keywords → vision
+    if user_wants_camera and not user_wants_file and st.session_state.camera_image_b64:
+        return "vision", user_text
+
+    # If user explicitly mentions file/doc keywords → file analysis
+    if user_wants_file and not user_wants_camera and st.session_state.file_content:
+        return "file", user_text
+
+    # Both or neither explicit — use context: if file loaded, short query goes to file
+    if st.session_state.file_content and not user_wants_camera:
+        if len(user_text.split()) <= 20:
+            return "file", user_text
+
+    # Camera fallback for short queries when only camera is loaded
+    if st.session_state.camera_image_b64 and not st.session_state.file_content:
+        if "?" in user_text or len(user_text.split()) <= 15:
             return "vision", user_text
 
     # YouTube
