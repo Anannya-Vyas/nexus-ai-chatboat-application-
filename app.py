@@ -164,6 +164,11 @@ def db_save_message(cid, role, content="", img_b64=None, img_caption=None, img_p
     conn = get_db()
     try:
         c = conn.cursor()
+        # Ensure the conversation exists (handles stale session IDs after server restart)
+        c.execute(
+            "INSERT INTO conversations (id, title) VALUES (%s, 'New Chat') ON CONFLICT (id) DO NOTHING",
+            (cid,)
+        )
         c.execute(
             "INSERT INTO messages (conversation_id, role, content, img_b64, img_caption, img_prompt, file_name) VALUES (%s, %s, %s, %s, %s, %s, %s)",
             (cid, role, content, img_b64, img_caption, img_prompt, file_name)
