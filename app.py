@@ -46,7 +46,21 @@ DATABASE_URL = st.secrets.get("DATABASE_URL") or os.environ.get("DATABASE_URL", 
 
 @st.cache_resource
 def get_pool():
-    return psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+    if not DATABASE_URL:
+        st.error("DATABASE_URL secret is not set. Add it in Streamlit Cloud → Settings → Secrets.")
+        st.stop()
+    try:
+        return psycopg2.pool.ThreadedConnectionPool(
+            1, 10, DATABASE_URL,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+    except Exception as e:
+        st.error(f"Could not connect to database: {e}")
+        st.stop()
 
 def get_db():
     return get_pool().getconn()
