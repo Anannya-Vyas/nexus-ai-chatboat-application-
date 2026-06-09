@@ -2797,7 +2797,7 @@ window._nexusLang = "{_cur_bcp}";
             msg = {
                 "role": dbm["role"],
                 "content": dbm["content"] or "",
-                "time": dbm["created_at"][-8:-3] if dbm["created_at"] else "--:--",
+                "time": dbm["created_at"].strftime('%H:%M') if hasattr(dbm["created_at"], 'strftime') else (str(dbm["created_at"])[-8:-3] if dbm["created_at"] else "--:--"),
                 "_db_id": dbm["id"],  # store row id for lazy image fetch
             }
             if dbm["img_caption"]:
@@ -3743,7 +3743,8 @@ with tab_gallery:
                         caption=item["prompt"][:50] + "…" if len(item["prompt"]) > 50 else item["prompt"],
                         use_container_width=True
                     )
-                    created = item["created_at"][:16] if item["created_at"] else ""
+                    raw_created = item["created_at"]
+                    created = raw_created.strftime('%Y-%m-%d %H:%M') if hasattr(raw_created, 'strftime') else (str(raw_created)[:16] if raw_created else "")
                     st.markdown(f"""
                     <div style="font-size:11px;color:{ts_col};text-align:center;margin-bottom:6px;">
                         {item.get('style','default')} • {created}
@@ -3809,7 +3810,13 @@ with tab_stats:
         st.markdown("**📋 Conversation History (Database)**")
         for conv in conversations[:20]:
             title_display = conv['title'][:55]
-            date_display  = conv['updated_at'][:16] if conv.get('updated_at') else ""
+            raw_dt = conv.get('updated_at')
+            if raw_dt is None:
+                date_display = ""
+            elif hasattr(raw_dt, 'strftime'):
+                date_display = raw_dt.strftime('%Y-%m-%d %H:%M')
+            else:
+                date_display = str(raw_dt)[:16]
             col_exp, col_del = st.columns([9, 1])
             with col_exp:
                 with st.expander(f"💬 {title_display} — {date_display}"):
