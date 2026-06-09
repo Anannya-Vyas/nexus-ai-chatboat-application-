@@ -3171,7 +3171,7 @@ img{{width:100%;border-radius:10px;box-shadow:0 3px 12px rgba(0,0,0,0.4);display
                     import base64 as _b64
                     import json as _json
                     # Safely encode text including Unicode (Hindi/Punjabi etc.)
-                    _txt_b64 = _b64.b64encode(raw_content[:1500].encode("utf-8")).decode("ascii")
+                    _txt_b64 = _b64.b64encode(raw_content[:8000].encode("utf-8")).decode("ascii")
                     _tts_btn_html = f'''<div style="margin-top:10px;padding-top:8px;border-top:1px solid {_bub_border};">
 <button id="tts_btn_{idx}" onclick="doTTS_{idx}()"
   style="background:none;border:1px solid {border};border-radius:8px;
