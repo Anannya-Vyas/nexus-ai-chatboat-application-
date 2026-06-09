@@ -6,3 +6,4 @@ PyMuPDF
 python-docx
 duckduckgo-search
 numpy
+psycopg2-binary

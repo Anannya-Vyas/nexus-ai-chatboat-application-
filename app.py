@@ -7,12 +7,14 @@ import html
 import json
 import os
 import re
-import sqlite3
 import uuid
 import numpy as np
 from io import BytesIO
 from PIL import Image, ImageEnhance, ImageOps, ImageFilter
 import streamlit.components.v1 as components
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import pool
 
 # PDF and DOCX support
 try:
@@ -38,200 +40,239 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATABASE SETUP  (SQLite – stores all conversations, messages, generated images)
+# DATABASE SETUP  (Neon PostgreSQL – persistent across deployments)
 # ══════════════════════════════════════════════════════════════════════════════
-DB_PATH = "nexusai.db"
+DATABASE_URL = st.secrets.get("DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+
+@st.cache_resource
+def get_pool():
+    return psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return get_pool().getconn()
+
+def release_db(conn):
+    get_pool().putconn(conn)
 
 def init_db():
     conn = get_db()
-    c = conn.cursor()
-    # Conversations table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            language TEXT DEFAULT 'English',
-            model TEXT DEFAULT 'llama-3.3-70b-versatile',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Messages table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT,
-            img_b64 TEXT,
-            img_caption TEXT,
-            img_prompt TEXT,
-            file_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        )
-    """)
-    # Generated images gallery
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS image_gallery (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            prompt TEXT NOT NULL,
-            img_b64 TEXT NOT NULL,
-            style TEXT DEFAULT 'default',
-            conversation_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # Usage stats
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS usage_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            action TEXT NOT NULL,
-            model TEXT,
-            tokens_used INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        # Conversations table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                language TEXT DEFAULT 'English',
+                model TEXT DEFAULT 'llama-3.3-70b-versatile',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Messages table
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                img_b64 TEXT,
+                img_caption TEXT,
+                img_prompt TEXT,
+                file_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+            )
+        """)
+        # Generated images gallery
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS image_gallery (
+                id SERIAL PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                img_b64 TEXT NOT NULL,
+                style TEXT DEFAULT 'default',
+                conversation_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Usage stats
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                id SERIAL PRIMARY KEY,
+                action TEXT NOT NULL,
+                model TEXT,
+                tokens_used INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+    finally:
+        release_db(conn)
 
 init_db()
 
 def _cleanup_empty_chats(active_cid=None):
-    """Delete 'New Chat' conversations that have zero messages — stale placeholders.
-    Never deletes the currently active conversation."""
     conn = get_db()
-    if active_cid:
-        conn.execute("""
-            DELETE FROM conversations
-            WHERE title = 'New Chat'
-              AND id != ?
-              AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
-        """, (active_cid,))
-    else:
-        conn.execute("""
-            DELETE FROM conversations
-            WHERE title = 'New Chat'
-              AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
-        """)
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        if active_cid:
+            c.execute("""
+                DELETE FROM conversations
+                WHERE title = 'New Chat'
+                  AND id != %s
+                  AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
+            """, (active_cid,))
+        else:
+            c.execute("""
+                DELETE FROM conversations
+                WHERE title = 'New Chat'
+                  AND id NOT IN (SELECT DISTINCT conversation_id FROM messages)
+            """)
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_new_conversation(title="New Chat", language="English", model="llama-3.3-70b-versatile"):
     cid = str(uuid.uuid4())
     conn = get_db()
-    conn.execute(
-        "INSERT INTO conversations (id, title, language, model) VALUES (?, ?, ?, ?)",
-        (cid, title, language, model)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO conversations (id, title, language, model) VALUES (%s, %s, %s, %s)",
+            (cid, title, language, model)
+        )
+        conn.commit()
+    finally:
+        release_db(conn)
     return cid
 
 def db_save_message(cid, role, content="", img_b64=None, img_caption=None, img_prompt=None, file_name=None):
     conn = get_db()
-    conn.execute(
-        "INSERT INTO messages (conversation_id, role, content, img_b64, img_caption, img_prompt, file_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (cid, role, content, img_b64, img_caption, img_prompt, file_name)
-    )
-    conn.execute(
-        "UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (cid,)
-    )
-    if content:
-        title_candidate = content[:50].strip().replace('\n', ' ')
-        conn.execute(
-            "UPDATE conversations SET title=? WHERE id=? AND title='New Chat'",
-            (title_candidate, cid)
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO messages (conversation_id, role, content, img_b64, img_caption, img_prompt, file_name) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (cid, role, content, img_b64, img_caption, img_prompt, file_name)
         )
-    conn.commit()
-    conn.close()
+        c.execute(
+            "UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=%s", (cid,)
+        )
+        if content:
+            title_candidate = content[:50].strip().replace('\n', ' ')
+            c.execute(
+                "UPDATE conversations SET title=%s WHERE id=%s AND title='New Chat'",
+                (title_candidate, cid)
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_get_messages(cid):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at", (cid,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM messages WHERE conversation_id=%s ORDER BY created_at", (cid,))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_db(conn)
 
 def db_get_messages_no_blobs(cid):
-    """Fast loader — skips img_b64 column to avoid transferring large base64 blobs.
-    Used when switching conversations; image blobs are fetched on demand."""
     conn = get_db()
-    rows = conn.execute(
-        """SELECT id, conversation_id, role, content, img_caption, img_prompt,
-                  file_name, created_at
-           FROM messages WHERE conversation_id=? ORDER BY created_at""", (cid,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("""
+            SELECT id, conversation_id, role, content, img_caption, img_prompt,
+                   file_name, created_at
+            FROM messages WHERE conversation_id=%s ORDER BY created_at
+        """, (cid,))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_db(conn)
 
 def db_get_img_b64(msg_id):
-    """Fetch a single message's image blob by row id."""
     conn = get_db()
-    row = conn.execute("SELECT img_b64 FROM messages WHERE id=?", (msg_id,)).fetchone()
-    conn.close()
-    return row["img_b64"] if row else None
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT img_b64 FROM messages WHERE id=%s", (msg_id,))
+        row = c.fetchone()
+        return row["img_b64"] if row else None
+    finally:
+        release_db(conn)
 
 def db_get_conversations():
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM conversations ORDER BY updated_at DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM conversations ORDER BY updated_at DESC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_db(conn)
 
 def db_delete_conversation(cid):
     conn = get_db()
-    conn.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
-    conn.execute("DELETE FROM conversations WHERE id=?", (cid,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM messages WHERE conversation_id=%s", (cid,))
+        c.execute("DELETE FROM conversations WHERE id=%s", (cid,))
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_save_image_gallery(prompt, img_b64, style="default", cid=None):
     conn = get_db()
-    conn.execute(
-        "INSERT INTO image_gallery (prompt, img_b64, style, conversation_id) VALUES (?, ?, ?, ?)",
-        (prompt, img_b64, style, cid)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO image_gallery (prompt, img_b64, style, conversation_id) VALUES (%s, %s, %s, %s)",
+            (prompt, img_b64, style, cid)
+        )
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_get_gallery(limit=20):
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM image_gallery ORDER BY created_at DESC LIMIT ?", (limit,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM image_gallery ORDER BY created_at DESC LIMIT %s", (limit,))
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_db(conn)
 
 def db_delete_gallery_image(image_id):
     conn = get_db()
-    conn.execute("DELETE FROM image_gallery WHERE id=?", (image_id,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM image_gallery WHERE id=%s", (image_id,))
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_log_usage(action, model=None, tokens=0):
     conn = get_db()
-    conn.execute(
-        "INSERT INTO usage_stats (action, model, tokens_used) VALUES (?, ?, ?)",
-        (action, model, tokens)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO usage_stats (action, model, tokens_used) VALUES (%s, %s, %s)",
+            (action, model, tokens)
+        )
+        conn.commit()
+    finally:
+        release_db(conn)
 
 def db_get_stats():
     conn = get_db()
-    total_messages = conn.execute("SELECT COUNT(*) FROM messages WHERE role='user'").fetchone()[0]
-    total_images   = conn.execute("SELECT COUNT(*) FROM image_gallery").fetchone()[0]
-    total_convos   = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-    conn.close()
-    return total_messages, total_images, total_convos
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM messages WHERE role='user'")
+        total_messages = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM image_gallery")
+        total_images = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM conversations")
+        total_convos = c.fetchone()[0]
+        return total_messages, total_images, total_convos
+    finally:
+        release_db(conn)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GROQ CLIENT
@@ -2545,6 +2586,23 @@ def process_input(user_text):
                 break
         return "image_gen", prompt or user_text
 
+    # File analysis — MUST come before vision check so PDF/DOCX always wins over camera
+    if st.session_state.file_content:
+        file_words = ["pdf", "document", "docx", "csv", "file", "attached", "attachment", "uploaded", "doc", "text", "json"]
+        referential = ["summarize", "explain this", "what is this", "what's this", "what does this",
+                       "analyze", "analyse", "tell me about", "from this", "in this", "key points",
+                       "main points", "main idea", "based on", "according to", "this text", "this pdf",
+                       "this file", "this document", "about this", "talking about"]
+        # If a file is loaded, route to file analysis unless user is clearly asking about the camera
+        camera_override_kw = ["photo", "camera", "picture i took", "snapshot", "webcam"]
+        if not any(k in lower for k in camera_override_kw):
+            # Route to file if user mentions file keywords, referential phrases, OR just asks a general question
+            if any(w in lower for w in file_words) or any(p in lower for p in referential):
+                return "file", user_text
+            # Also auto-route short queries to file when file is loaded (user is likely asking about it)
+            if len(user_text.split()) <= 20:
+                return "file", user_text
+
     # Vision — camera image attached
     vis_kw = ["what do you see", "what is this", "describe this", "analyze this", "explain this",
               "describe the", "identify", "recognize", "read this", "what's in", "solve this",
@@ -2552,15 +2610,6 @@ def process_input(user_text):
     if st.session_state.camera_image_b64:
         if any(k in lower for k in vis_kw) or "?" in user_text or len(user_text.split()) <= 15:
             return "vision", user_text
-
-    # File analysis
-    if st.session_state.file_content:
-        file_words = ["pdf", "document", "docx", "csv", "file", "attached", "attachment", "uploaded", "doc", "text", "json"]
-        referential = ["summarize", "explain this", "what is this", "what's this", "what does this",
-                       "analyze", "analyse", "tell me about", "from this", "in this", "key points",
-                       "main points", "main idea", "based on", "according to", "this text"]
-        if any(w in lower for w in file_words) or any(p in lower for p in referential):
-            return "file", user_text
 
     # YouTube
     if any(k in lower for k in ["youtube", "watch video", "find video", "suggest video", "play video"]):
@@ -2573,14 +2622,15 @@ def process_input(user_text):
         topic = m.group(1) if m else re.sub(r"(poem|poetry|write|compose|a|about|on|for|me)", "", lower).strip()
         return "poem", topic
 
-    # File analysis — auto-route if a file is loaded and the query is about it
-    file_query_kw = [
-        "file", "pdf", "document", "doc", "attached", "uploaded", "attachment",
-        "what is in", "what's in", "contents of", "summarize", "analyse", "analyze",
-        "read the", "tell me about the", "extract", "explain the",
-    ]
-    if st.session_state.file_content and any(k in lower for k in file_query_kw):
-        return "file", user_text
+    # File analysis fallback — catches any remaining file-related queries
+    if st.session_state.file_content:
+        file_query_kw = [
+            "file", "pdf", "document", "doc", "attached", "uploaded", "attachment",
+            "what is in", "what's in", "contents of", "summarize", "analyse", "analyze",
+            "read the", "tell me about the", "extract", "explain the",
+        ]
+        if any(k in lower for k in file_query_kw):
+            return "file", user_text
 
     # Translation
     if any(k in lower for k in ["translate", "translation", "say in", "how do you say"]):
